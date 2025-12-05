@@ -106,7 +106,8 @@ async def health_check():
         "services": {
             "geocoding": "operational",
             "routing": "operational"
-        }
+        },
+        "version": "1.0.0"
     }
 
 @app.post("/api/v1/process-route", response_model=RouteResponse)

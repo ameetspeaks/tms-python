@@ -1,3 +1,12 @@
+---
+title: TMS Tracking API
+emoji: 🚛
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+---
+
 # TMS Tracking API
 
 Vehicle tracking and route processing API for Transportation Management System (TMS).
