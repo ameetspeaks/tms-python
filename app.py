@@ -1,12 +1,14 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import logging
 import os
 import sys
+import httpx
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +28,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Environment variables
+VERCEL_API_URL = os.getenv("VERCEL_API_URL", "https://tms-navy-one.vercel.app")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+ENABLE_CRON = os.getenv("ENABLE_CRON", "false").lower() == "true"
+OSRM_BASE_URL = os.getenv("OSRM_API_URL", "http://router.project-osrm.org")
+
 # Initialize FastAPI app
 app = FastAPI(
     title="TMS Tracking API",
@@ -36,18 +44,9 @@ app = FastAPI(
 )
 
 # CORS configuration
-origins = [
-    "http://localhost:3000",
-    "http://localhost:8080",
-    "http://localhost:5173",
-    "https://tms-navy-one.vercel.app",
-    "https://ameetspeaks-tms.hf.space",
-    "*"  # Allow all for testing, remove in production
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,9 +56,14 @@ app.add_middleware(
 logger.info("Initializing services...")
 geocoding_service = GeocodingService()
 route_processor = RouteProcessor()
-osrm_base_url = os.getenv("OSRM_API_URL", "http://router.project-osrm.org")
-osrm_client = OSRMClient(base_url=osrm_base_url)
-logger.info(f"Services initialized. OSRM URL: {osrm_base_url}")
+osrm_client = OSRMClient(base_url=OSRM_BASE_URL)
+logger.info(f"Services initialized. OSRM URL: {OSRM_BASE_URL}")
+
+# HTTP client for cron jobs
+http_client = httpx.AsyncClient(timeout=60.0)
+
+# Scheduler for cron jobs
+scheduler = AsyncIOScheduler()
 
 # Pydantic models
 class Coordinate(BaseModel):
@@ -69,7 +73,7 @@ class Coordinate(BaseModel):
     vehicle_id: Optional[str] = Field(None, description="Vehicle identifier")
 
 class RouteRequest(BaseModel):
-    coordinates: List[Coordinate] = Field(..., min_items=2, description="List of GPS coordinates")
+    coordinates: List[Coordinate] = Field(..., min_length=2, description="List of GPS coordinates (minimum 2)")
     simplify: bool = Field(default=True, description="Apply Douglas-Peucker simplification")
     snap_to_roads: bool = Field(default=True, description="Snap coordinates to actual roads")
     reverse_geocode: bool = Field(default=True, description="Get place names for coordinates")
@@ -96,15 +100,111 @@ class GeocodingRequest(BaseModel):
 class GeocodingResponse(BaseModel):
     results: List[Dict[str, Any]]
 
+# Cron job functions
+async def location_poll_job():
+    """Poll location data from Telenity every minute"""
+    try:
+        logger.info("🔄 Starting location poll job...")
+        
+        response = await http_client.post(
+            f"{VERCEL_API_URL}/api/cron/location-poll",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {CRON_SECRET}"
+            },
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Location poll successful: {response.json()}")
+        else:
+            logger.error(f"❌ Location poll failed: {response.status_code} - {response.text}")
+            
+    except httpx.TimeoutException:
+        logger.error("❌ Location poll timeout")
+    except Exception as e:
+        logger.error(f"❌ Location poll error: {str(e)}", exc_info=True)
+
+async def consent_poll_job():
+    """Poll consent data from Telenity every hour"""
+    try:
+        logger.info("🔄 Starting consent poll job...")
+        
+        response = await http_client.post(
+            f"{VERCEL_API_URL}/api/telenity/consent/poll",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {CRON_SECRET}"
+            },
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Consent poll successful: {response.json()}")
+        else:
+            logger.error(f"❌ Consent poll failed: {response.status_code} - {response.text}")
+            
+    except httpx.TimeoutException:
+        logger.error("❌ Consent poll timeout")
+    except Exception as e:
+        logger.error(f"❌ Consent poll error: {str(e)}", exc_info=True)
+
+# Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
+    logger.info("=" * 70)
     logger.info("🚀 TMS Tracking API started successfully")
-    logger.info(f"📍 API Documentation: http://localhost:7860/docs")
+    logger.info(f"📍 API Documentation: /docs")
+    logger.info(f"❤️  Health Check: /health")
+    logger.info(f"🌐 OSRM URL: {OSRM_BASE_URL}")
+    logger.info(f"🔗 Vercel API: {VERCEL_API_URL}")
+    
+    # Start cron jobs if enabled
+    if ENABLE_CRON:
+        logger.info("⏰ Starting cron jobs...")
+        
+        # Location poll - every minute
+        scheduler.add_job(
+            location_poll_job,
+            'cron',
+            minute='*',
+            id='location_poll',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("  ✓ Location poll: every minute")
+        
+        # Consent poll - every hour
+        scheduler.add_job(
+            consent_poll_job,
+            'cron',
+            hour='*',
+            minute='0',
+            id='consent_poll',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("  ✓ Consent poll: every hour")
+        
+        scheduler.start()
+        logger.info("✅ Cron jobs started successfully")
+    else:
+        logger.info("⚠️  Cron jobs disabled (set ENABLE_CRON=true to enable)")
+    
+    logger.info("=" * 70)
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("👋 TMS Tracking API shutting down")
+    logger.info("👋 TMS Tracking API shutting down...")
+    
+    if scheduler.running:
+        scheduler.shutdown()
+        logger.info("✅ Scheduler stopped")
+    
+    await http_client.aclose()
+    logger.info("✅ HTTP client closed")
 
+# API endpoints
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
@@ -113,11 +213,14 @@ async def root():
         "version": "1.0.0",
         "status": "operational",
         "docs_url": "/docs",
+        "health_url": "/health",
         "endpoints": {
-            "health": "/health",
             "process_route": "/api/v1/process-route",
             "geocode": "/api/v1/geocode",
-        }
+            "trigger_location_poll": "/api/trigger/location-poll",
+            "trigger_consent_poll": "/api/trigger/consent-poll"
+        },
+        "cron_enabled": ENABLE_CRON
     }
 
 @app.get("/health")
@@ -129,13 +232,19 @@ async def health_check():
         "services": {
             "geocoding": "operational",
             "routing": "operational",
-            "osrm": osrm_base_url
+            "osrm": OSRM_BASE_URL,
+            "vercel": VERCEL_API_URL
+        },
+        "cron_jobs": {
+            "enabled": ENABLE_CRON,
+            "scheduler_running": scheduler.running if ENABLE_CRON else False,
+            "jobs": [job.id for job in scheduler.get_jobs()] if ENABLE_CRON and scheduler.running else []
         },
         "version": "1.0.0"
     }
 
 @app.post("/api/v1/process-route", response_model=RouteResponse)
-async def process_route(request: RouteRequest, background_tasks: BackgroundTasks):
+async def process_route(request: RouteRequest):
     """
     Process GPS coordinates from Telenity SIM tracking:
     - Simplify route (remove redundant points)
@@ -146,7 +255,10 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
     """
     try:
         if len(request.coordinates) < 2:
-            raise HTTPException(status_code=400, detail="At least 2 coordinates required")
+            raise HTTPException(
+                status_code=400, 
+                detail="At least 2 coordinates required for route processing"
+            )
         
         logger.info(f"Processing route with {len(request.coordinates)} points")
         
@@ -160,10 +272,13 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
         
         # Step 2: Snap to roads if requested
         if request.snap_to_roads:
-            snapped_coords = await osrm_client.snap_to_roads(coords)
-            if snapped_coords:
-                coords = snapped_coords
-                logger.info(f"Snapped to roads: {len(coords)} points")
+            try:
+                snapped_coords = await osrm_client.snap_to_roads(coords)
+                if snapped_coords:
+                    coords = snapped_coords
+                    logger.info(f"Snapped to roads: {len(coords)} points")
+            except Exception as e:
+                logger.warning(f"Road snapping failed, using original coords: {e}")
         
         # Step 3: Process each point
         processed_points = []
@@ -192,10 +307,14 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
                     )
                     point_data["speed"] = speed
             
-            # Reverse geocode if requested (only for start and end to save rate limits)
+            # Reverse geocode if requested (only start and end to respect rate limits)
             if request.reverse_geocode and (i == 0 or i == len(coords) - 1):
-                place_name = await geocoding_service.reverse_geocode(lat, lng)
-                point_data["place_name"] = place_name
+                try:
+                    place_name = await geocoding_service.reverse_geocode(lat, lng)
+                    point_data["place_name"] = place_name
+                except Exception as e:
+                    logger.warning(f"Geocoding failed for point {i}: {e}")
+                    point_data["place_name"] = "Unknown Location"
             
             processed_points.append(ProcessedPoint(**point_data))
         
@@ -205,9 +324,12 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
         # Step 5: Estimate duration using OSRM
         duration_minutes = None
         if len(coords) >= 2:
-            duration_minutes = await osrm_client.get_route_duration(coords)
+            try:
+                duration_minutes = await osrm_client.get_route_duration(coords)
+            except Exception as e:
+                logger.warning(f"Duration estimation failed: {e}")
         
-        logger.info(f"✅ Route processed: {len(processed_points)} points, {total_distance:.2f} km")
+        logger.info(f"✅ Route processed successfully: {len(processed_points)} points, {total_distance:.2f} km")
         
         return RouteResponse(
             original_points=len(request.coordinates),
@@ -222,7 +344,10 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
         raise
     except Exception as e:
         logger.error(f"Error processing route: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal server error: {str(e)}"
+        )
 
 @app.post("/api/v1/geocode", response_model=GeocodingResponse)
 async def geocode_batch(request: GeocodingRequest):
@@ -232,50 +357,98 @@ async def geocode_batch(request: GeocodingRequest):
     try:
         results = []
         for coord in request.coordinates:
-            place_name = await geocoding_service.reverse_geocode(coord.lat, coord.lng)
+            try:
+                place_name = await geocoding_service.reverse_geocode(coord.lat, coord.lng)
+            except Exception as e:
+                logger.warning(f"Geocoding failed for {coord.lat},{coord.lng}: {e}")
+                place_name = "Unknown Location"
+            
             results.append({
                 "lat": coord.lat,
                 "lng": coord.lng,
                 "place_name": place_name,
                 "timestamp": coord.timestamp
             })
+        
         return GeocodingResponse(results=results)
+        
     except Exception as e:
-        logger.error(f"Error in batch geocoding: {str(e)}")
+        logger.error(f"Error in batch geocoding: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# Manual trigger endpoints for cron jobs
+@app.post("/api/trigger/location-poll")
+async def trigger_location_poll():
+    """Manually trigger location poll job"""
+    try:
+        await location_poll_job()
+        return {
+            "status": "success",
+            "message": "Location poll triggered successfully",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Manual location poll trigger failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/trigger/consent-poll")
+async def trigger_consent_poll():
+    """Manually trigger consent poll job"""
+    try:
+        await consent_poll_job()
+        return {
+            "status": "success",
+            "message": "Consent poll triggered successfully",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Manual consent poll trigger failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/cron/status")
+async def cron_status():
+    """Get status of all cron jobs"""
+    if not ENABLE_CRON or not scheduler.running:
+        return {
+            "enabled": ENABLE_CRON,
+            "running": False,
+            "jobs": []
+        }
+    
+    jobs_info = []
+    for job in scheduler.get_jobs():
+        jobs_info.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger)
+        })
+    
+    return {
+        "enabled": ENABLE_CRON,
+        "running": scheduler.running,
+        "jobs": jobs_info
+    }
+
+# Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    logger.error(f"Global exception: {str(exc)}", exc_info=True)
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error", "error": str(exc)}
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "timestamp": datetime.utcnow().isoformat()
+        }
     )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
-```
-
-## 8. **Directory Structure** (Make sure you have this)
-```
-tms-python/
-├── .dockerignore
-├── .github/
-│   └── workflows/
-│       └── sync-to-huggingface.yml
-├── services/
-│   ├── __init__.py
-│   ├── geocoding.py
-│   ├── osrm_client.py
-│   └── route_processor.py
-├── utils/
-│   ├── __init__.py
-│   └── helpers.py
-├── tests/
-│   ├── __init__.py
-│   └── test_services.py
-├── Dockerfile
-├── requirements.txt
-├── app.py
-└── README.md
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=7860,
+        log_level="info"
+    )
