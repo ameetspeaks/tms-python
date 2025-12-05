@@ -1,10 +1,15 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
 import os
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from services.geocoding import GeocodingService
 from services.route_processor import RouteProcessor
@@ -14,14 +19,20 @@ from utils.helpers import calculate_distance, estimate_speed
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
+# Initialize FastAPI app
 app = FastAPI(
     title="TMS Tracking API",
     description="Vehicle tracking and route processing API for TMS (HuggingFace Spaces)",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # CORS configuration
@@ -30,7 +41,8 @@ origins = [
     "http://localhost:8080",
     "http://localhost:5173",
     "https://tms-navy-one.vercel.app",
-    "https://ameetspeaks-tms.hf.space"
+    "https://ameetspeaks-tms.hf.space",
+    "*"  # Allow all for testing, remove in production
 ]
 
 app.add_middleware(
@@ -42,19 +54,22 @@ app.add_middleware(
 )
 
 # Initialize services
+logger.info("Initializing services...")
 geocoding_service = GeocodingService()
 route_processor = RouteProcessor()
-osrm_client = OSRMClient(base_url=os.getenv("OSRM_API_URL", "http://router.project-osrm.org"))
+osrm_base_url = os.getenv("OSRM_API_URL", "http://router.project-osrm.org")
+osrm_client = OSRMClient(base_url=osrm_base_url)
+logger.info(f"Services initialized. OSRM URL: {osrm_base_url}")
 
 # Pydantic models
 class Coordinate(BaseModel):
-    lat: float = Field(..., ge=-90, le=90)
-    lng: float = Field(..., ge=-180, le=180)
-    timestamp: Optional[datetime] = None
-    vehicle_id: Optional[str] = None
+    lat: float = Field(..., ge=-90, le=90, description="Latitude")
+    lng: float = Field(..., ge=-180, le=180, description="Longitude")
+    timestamp: Optional[datetime] = Field(None, description="Timestamp of GPS ping")
+    vehicle_id: Optional[str] = Field(None, description="Vehicle identifier")
 
 class RouteRequest(BaseModel):
-    coordinates: List[Coordinate]
+    coordinates: List[Coordinate] = Field(..., min_items=2, description="List of GPS coordinates")
     simplify: bool = Field(default=True, description="Apply Douglas-Peucker simplification")
     snap_to_roads: bool = Field(default=True, description="Snap coordinates to actual roads")
     reverse_geocode: bool = Field(default=True, description="Get place names for coordinates")
@@ -62,10 +77,10 @@ class RouteRequest(BaseModel):
 class ProcessedPoint(BaseModel):
     lat: float
     lng: float
-    timestamp: Optional[datetime]
-    place_name: Optional[str]
-    speed: Optional[float]
-    distance_from_previous: Optional[float]
+    timestamp: Optional[datetime] = None
+    place_name: Optional[str] = None
+    speed: Optional[float] = None
+    distance_from_previous: Optional[float] = None
 
 class RouteResponse(BaseModel):
     original_points: int
@@ -73,7 +88,7 @@ class RouteResponse(BaseModel):
     route: List[ProcessedPoint]
     encoded_polyline: str
     total_distance_km: float
-    estimated_duration_minutes: Optional[float]
+    estimated_duration_minutes: Optional[float] = None
 
 class GeocodingRequest(BaseModel):
     coordinates: List[Coordinate]
@@ -81,15 +96,22 @@ class GeocodingRequest(BaseModel):
 class GeocodingResponse(BaseModel):
     results: List[Dict[str, Any]]
 
-class ReverseGeocodeRequest(BaseModel):
-    lat: float
-    lng: float
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 TMS Tracking API started successfully")
+    logger.info(f"📍 API Documentation: http://localhost:7860/docs")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("👋 TMS Tracking API shutting down")
 
 @app.get("/")
 async def root():
+    """Root endpoint with API information"""
     return {
         "message": "TMS Tracking API",
         "version": "1.0.0",
+        "status": "operational",
         "docs_url": "/docs",
         "endpoints": {
             "health": "/health",
@@ -100,12 +122,14 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
             "geocoding": "operational",
-            "routing": "operational"
+            "routing": "operational",
+            "osrm": osrm_base_url
         },
         "version": "1.0.0"
     }
@@ -168,10 +192,8 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
                     )
                     point_data["speed"] = speed
             
-            # Reverse geocode if requested
-            if request.reverse_geocode:
-                # Only geocode start and end to save rate limits if many points, or check logic
-                # For now, geocode all simplified points but with cache
+            # Reverse geocode if requested (only for start and end to save rate limits)
+            if request.reverse_geocode and (i == 0 or i == len(coords) - 1):
                 place_name = await geocoding_service.reverse_geocode(lat, lng)
                 point_data["place_name"] = place_name
             
@@ -185,6 +207,8 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
         if len(coords) >= 2:
             duration_minutes = await osrm_client.get_route_duration(coords)
         
+        logger.info(f"✅ Route processed: {len(processed_points)} points, {total_distance:.2f} km")
+        
         return RouteResponse(
             original_points=len(request.coordinates),
             processed_points=len(processed_points),
@@ -194,9 +218,11 @@ async def process_route(request: RouteRequest, background_tasks: BackgroundTasks
             estimated_duration_minutes=duration_minutes
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing route: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/api/v1/geocode", response_model=GeocodingResponse)
 async def geocode_batch(request: GeocodingRequest):
@@ -217,3 +243,39 @@ async def geocode_batch(request: GeocodingRequest):
     except Exception as e:
         logger.error(f"Error in batch geocoding: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"Global exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error": str(exc)}
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
+```
+
+## 8. **Directory Structure** (Make sure you have this)
+```
+tms-python/
+├── .dockerignore
+├── .github/
+│   └── workflows/
+│       └── sync-to-huggingface.yml
+├── services/
+│   ├── __init__.py
+│   ├── geocoding.py
+│   ├── osrm_client.py
+│   └── route_processor.py
+├── utils/
+│   ├── __init__.py
+│   └── helpers.py
+├── tests/
+│   ├── __init__.py
+│   └── test_services.py
+├── Dockerfile
+├── requirements.txt
+├── app.py
+└── README.md
