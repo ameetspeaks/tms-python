@@ -15,12 +15,3 @@ requests==2.31.0
 aiohttp==3.9.3
 python-multipart==0.0.9
 APScheduler==3.10.4
-```
-
-**Add these secrets to HuggingFace Space:**
-
-Go to: https://huggingface.co/spaces/ameetspeaks/tms/settings
-```
-VERCEL_API_URL=https://tms-navy-one.vercel.app
-CRON_SECRET=AIC0E35w_6wXDYIz0nVtZHN59z5fUZp4o7c0bz8lz5A
-ENABLE_CRON=true
