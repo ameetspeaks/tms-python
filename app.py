@@ -198,11 +198,12 @@ async def startup_event():
         )
         logger.info("  ✓ Location poll: every 15 minutes")
         
-        # Consent poll - every 60 minutes
+        # Consent poll - every 60 minutes (hourly)
         scheduler.add_job(
             consent_poll_job,
             'cron',
-            minute='*/60',
+            hour='*',
+            minute='0',
             id='consent_poll',
             replace_existing=True,
             max_instances=1
