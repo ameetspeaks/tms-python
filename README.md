@@ -7,6 +7,14 @@ sdk: docker
 app_port: 7860
 ---
 
+**Environment Variables Required:**
+
+- `VERCEL_API_URL`: https://tms-navy-one.vercel.app
+- `CRON_SECRET`: AIC0E35w_6wXDYIz0nVtZHN59z5fUZp4o7c0bz8lz5A
+- `ENABLE_CRON`: true
+- `OSRM_API_URL`: http://router.project-osrm.org
+- `LOG_LEVEL`: INFO
+
 # TMS Tracking API
 
 Vehicle tracking and route processing API for Transportation Management System (TMS).

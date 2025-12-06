@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
 
 # Install system dependencies
@@ -11,23 +12,34 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements first for better caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Create a non-root user to run the app (required for HuggingFace Spaces)
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Create non-root user (required by HuggingFace Spaces)
 RUN useradd -m -u 1000 user
+
+# Set up home directory
 USER user
 ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH
 
-# Copy application code with correct ownership
-COPY --chown=user . .
+# Set working directory to user home
+WORKDIR $HOME/app
 
-# Expose port (HuggingFace uses 7860 by default)
+# Copy application code with correct ownership
+COPY --chown=user:user . .
+
+# Create necessary directories
+RUN mkdir -p $HOME/app/services $HOME/app/utils $HOME/app/tests
+
+# Expose port 7860 (HuggingFace Spaces default)
 EXPOSE 7860
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
 # Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--log-level", "info"]
