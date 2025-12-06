@@ -102,7 +102,7 @@ class GeocodingResponse(BaseModel):
 
 # Cron job functions
 async def location_poll_job():
-    """Poll location data from Telenity every minute"""
+    """Poll location data from Telenity every 15 minutes"""
     try:
         logger.info("🔄 Starting location poll job...")
         
@@ -126,7 +126,7 @@ async def location_poll_job():
         logger.error(f"❌ Location poll error: {str(e)}", exc_info=True)
 
 async def consent_poll_job():
-    """Poll consent data from Telenity every hour"""
+    """Poll consent data from Telenity every 60 minutes"""
     try:
         logger.info("🔄 Starting consent poll job...")
         
@@ -149,6 +149,30 @@ async def consent_poll_job():
     except Exception as e:
         logger.error(f"❌ Consent poll error: {str(e)}", exc_info=True)
 
+async def auth_token_refresh_job():
+    """Refresh authentication token every 6 hours"""
+    try:
+        logger.info("🔄 Starting authentication token refresh job...")
+        
+        response = await http_client.post(
+            f"{VERCEL_API_URL}/api/telenity/auth/refresh",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {CRON_SECRET}"
+            },
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Auth token refresh successful: {response.json()}")
+        else:
+            logger.error(f"❌ Auth token refresh failed: {response.status_code} - {response.text}")
+            
+    except httpx.TimeoutException:
+        logger.error("❌ Auth token refresh timeout")
+    except Exception as e:
+        logger.error(f"❌ Auth token refresh error: {str(e)}", exc_info=True)
+
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
@@ -163,28 +187,39 @@ async def startup_event():
     if ENABLE_CRON:
         logger.info("⏰ Starting cron jobs...")
         
-        # Location poll - every minute
+        # Location poll - every 15 minutes
         scheduler.add_job(
             location_poll_job,
             'cron',
-            minute='*',
+            minute='*/15',
             id='location_poll',
             replace_existing=True,
             max_instances=1
         )
-        logger.info("  ✓ Location poll: every minute")
+        logger.info("  ✓ Location poll: every 15 minutes")
         
-        # Consent poll - every hour
+        # Consent poll - every 60 minutes
         scheduler.add_job(
             consent_poll_job,
             'cron',
-            hour='*',
-            minute='0',
+            minute='*/60',
             id='consent_poll',
             replace_existing=True,
             max_instances=1
         )
-        logger.info("  ✓ Consent poll: every hour")
+        logger.info("  ✓ Consent poll: every 60 minutes")
+        
+        # Auth token refresh - every 6 hours
+        scheduler.add_job(
+            auth_token_refresh_job,
+            'cron',
+            hour='*/6',
+            minute='0',
+            id='auth_token_refresh',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("  ✓ Auth token refresh: every 6 hours")
         
         scheduler.start()
         logger.info("✅ Cron jobs started successfully")
